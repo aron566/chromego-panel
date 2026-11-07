@@ -6,6 +6,7 @@ import base64
 import json
 import pathlib
 import tempfile
+import time
 
 import yaml
 
@@ -34,6 +35,24 @@ assert server._clash_proxy(vm(dict(add="1.2.3.4", port="443", tls=True, net="tcp
 a = server._mk_node("vless", "1.2.3.4", 443, "id-a", "", None, [], "")
 b = server._mk_node("vless", "1.2.3.4", 443, "id-b", "", None, [], "")
 assert server.nodes_fingerprint([a]) != server.nodes_fingerprint([b])
+# Same endpoint is not enough: auth/SNI/transport/path remain part of identity; display names do not.
+v2 = vm(dict(add="1.2.3.4", port="443", id="u", aid="0", net="ws", path="/p",
+             host="h.com", tls="tls", sni="s.com", ps="另一个名字"))
+v3 = vm(dict(add="1.2.3.4", port="443", id="different", aid="0", net="ws", path="/p",
+             host="h.com", tls="tls", sni="s.com", ps="名字"))
+assert server.link_fingerprint(v) == server.link_fingerprint(v2)
+assert server.link_fingerprint(v) != server.link_fingerprint(v3)
+u1 = "vless://uuid@EXAMPLE.com:443?type=ws&path=%2Fws&sni=one.example#one"
+u2 = "vless://uuid@EXAMPLE.com:443?sni=one.example&path=%2Fws&type=ws#renamed"
+u3 = "vless://other@EXAMPLE.com:443?type=ws&path=%2Fws&sni=one.example#one"
+assert server.link_fingerprint(u1) == server.link_fingerprint(u2)
+assert server.link_fingerprint(u1) != server.link_fingerprint(u3)
+node_a = dict(protocol="vless", links=[dict(url=u1, name="old")])
+node_b = dict(protocol="vless", links=[dict(url=u2, name="renamed")])
+node_c = dict(protocol="vless", links=[dict(url="vless://uuid@EXAMPLE.com:443?type=grpc&serviceName=svc&sni=one.example#one", name="other transport")])
+assert server.node_fingerprint(node_a) == server.node_fingerprint(node_b)
+assert server.node_fingerprint(node_a) != server.node_fingerprint(node_c)
+assert server.SSL_CTX.check_hostname and server.SSL_CTX.verify_mode == server.ssl.CERT_REQUIRED
 
 # 测活判定逻辑（不真连网）
 v_tcp = vm(dict(add="1.2.3.4", port="443", id="u", net="tcp", tls="tls", sni="s.com", ps="t"))
@@ -68,8 +87,10 @@ tj = "trojan://pw@7.7.7.7:443?sni=s.com#tr"
 ss = "ss://YWVzLTI1Ni1nY206cHc=@8.8.8.8:8388#s"
 # 旧版缓存可能混进不收的协议（tuic），ext_alive 必须挡掉
 tuic = "tuic://uuid:pw@6.6.6.6:443#bad"
+fresh_time = time.time() - 10
 (server.CACHE_DIR / "ext_demo.json").write_text(
-    json.dumps(dict(fetched="t", total=6, nodes=[dict(url=v, name="m", ms=None),
+    json.dumps(dict(fetched=server.datetime.fromtimestamp(fresh_time).strftime("%Y-%m-%d %H:%M"),
+                    fetched_at=fresh_time, total=6, nodes=[dict(url=v, name="m", ms=None),
                                                  dict(url=h1, name="h1", ms=None),
                                                  dict(url=h2, name="h2", ms=None),
                                                  dict(url=h2b, name="h2b", ms=None),
@@ -91,5 +112,69 @@ assert base64.b64decode(server.build_sub()).decode().count("://") == 5
 cfg = yaml.safe_load(server.build_sub_clash())
 assert [g["type"] for g in cfg["proxy-groups"]] == ["select", "url-test"]
 assert len(cfg["proxies"]) == 6
+
+# Cross-source exact duplicates use the newest successful cache while preserving the source-order policy.
+server.EXT_SOURCES["demo_new"] = dict(label="demo_new")
+new_time = time.time() - 2
+(server.CACHE_DIR / "ext_demo_new.json").write_text(json.dumps(dict(
+    fetched=server.datetime.fromtimestamp(new_time).strftime("%Y-%m-%d %H:%M"), fetched_at=new_time,
+    nodes=[dict(url="trojan://pw@7.7.7.7:443?sni=s.com#fresh", name="fresh", ms=20)])))
+old_url = "ss://YWVzLTI1Ni1nY206cHc=@11.11.11.11:8388#stale"
+(server.CACHE_DIR / "ext_stale.json").write_text(json.dumps(dict(
+    fetched="old", fetched_at=time.time() - server.EXT_CACHE_MAX_AGE_SECONDS - 1,
+    nodes=[dict(url=old_url, name="stale", ms=None)])))
+urls_and_names = server.ext_alive()
+assert any(u.endswith("#fresh") and name == "fresh" for u, name, _ in urls_and_names)
+assert not any(u == old_url for u, _, _ in urls_and_names)
+# Same endpoint with a different password is a distinct node and must survive cross-source dedup.
+server.EXT_SOURCES["demo_auth"] = dict(label="demo_auth")
+auth_url = "trojan://different-password@7.7.7.7:443?sni=s.com#different-auth"
+(server.CACHE_DIR / "ext_demo_auth.json").write_text(json.dumps(dict(
+    fetched=server.datetime.fromtimestamp(new_time).strftime("%Y-%m-%d %H:%M"), fetched_at=new_time,
+    nodes=[dict(url=auth_url, name="different-auth", ms=25)])))
+urls_and_names = server.ext_alive()
+assert any(u.endswith("#fresh") for u, _, _ in urls_and_names) and any(u == auth_url for u, _, _ in urls_and_names)
+
+# Invalid/empty 200 responses and failed atomic replacement must never destroy last-good cache.
+cache_path = server.ext_cache_file("demo")
+last_good = cache_path.read_bytes()
+class FakeResponse:
+    def __init__(self, body): self.body = body
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self): return self.body
+old_open_url, old_probe, old_sleep = server.open_url, server._probe_link, server.time.sleep
+server.time.sleep = lambda *_: None
+server.EXT_SOURCES["demo"] = dict(label="demo", url="https://feed.example/sub", mirror="https://mirror.example/sub")
+try:
+    for body in (b"", b"not a subscription", b"https://unsupported.example/text"):
+        server.open_url = lambda *args, _body=body, **kwargs: FakeResponse(_body)
+        try:
+            server.refresh_ext("demo")
+            raise AssertionError("invalid feed unexpectedly replaced cache")
+        except RuntimeError:
+            pass
+        assert cache_path.read_bytes() == last_good
+    valid_feed = b"hysteria2://auth@example.com:443?sni=example.com#ok"
+    def fallback_open(url, *args, **kwargs):
+        return FakeResponse(b"<html>upstream error</html>" if "feed.example" in url else valid_feed)
+    server.open_url = fallback_open
+    data = server.refresh_ext("demo")
+    assert data["source"] == "jsDelivr" and data["keep"] == 1 and data["fetched_at"] > 0
+    assert json.loads(cache_path.read_text())["nodes"][0]["url"].startswith("hysteria2://")
+    written = cache_path.read_bytes()
+    old_replace = server.os.replace
+    try:
+        server.os.replace = lambda *args: (_ for _ in ()).throw(OSError("simulated replace failure"))
+        try:
+            server._write_json_atomic(cache_path, {"nodes": []})
+            raise AssertionError("atomic replace failure was not raised")
+        except OSError:
+            pass
+        assert cache_path.read_bytes() == written
+    finally:
+        server.os.replace = old_replace
+finally:
+    server.open_url, server._probe_link, server.time.sleep = old_open_url, old_probe, old_sleep
 
 print("selftest OK")

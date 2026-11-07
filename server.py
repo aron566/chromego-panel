@@ -28,6 +28,7 @@ import yaml
 
 WARMING = False  # 冷启动预热中标志（预热线程完成后置 False）
 EXT_REFRESHING = False  # 外部订阅源刷新中标志
+_EXT_REFRESH_LOCK = threading.Lock()  # 防止手动/后台刷新并发启动
 EXT_ERRORS = {}         # 源 key -> 最近一次失败原因（成功即清除），用于界面显示"该源失效"
 EXT_ATTEMPT = {}        # 源 key -> 最近一次拉取尝试的时间戳（失败也记，避免自动刷新每分钟重试）
 
@@ -60,6 +61,7 @@ EXT_KEEP_TCP = 120     # TCP 系（vmess/vless/trojan/ss）：真握手测活后
 EXT_KEEP_HY1 = 20      # hysteria v1：QUIC 走 UDP 无法 TCP 握手测活，免检直收
 EXT_KEEP_HY2 = 60      # hysteria2：同上免检直收（用户实测移动宽带对 hy2 兼容最好）
 EXT_PROBE_LIMIT = 800  # 每源最多送测的 TCP 链接数，防超大源把刷新拖成几分钟
+EXT_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60  # 超过一天的旧节点不再进入订阅
 _EXT_TCP_SCHEMES = ("vmess", "vless", "trojan", "ss")
 _EXT_SCHEMES = _EXT_TCP_SCHEMES + ("hysteria", "hysteria2")  # 与面板四个槽位类型对应的协议全集
 # 外部源只在一种时机刷新：用户在界面上点「立即更新」按钮
@@ -83,9 +85,7 @@ GITLAB_TPL = ("https://gitlab.com/free9999/ipupdate/-/raw/master"
 MIRROR_TPL = ("https://www.67867867.xyz/Alvin9999/PAC/refs/heads/master"
               "/backup/img/1/2/ipp/{remote}/{slot}/{filename}")
 
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
+SSL_CTX = ssl.create_default_context()  # 验证证书链和主机名，避免代理/节点探测被中间人冒充
 
 
 # ---------- 网络：本地代理自动探测 ----------
@@ -462,8 +462,18 @@ def parse_config_text(text: str, label: str):
 
 
 def nodes_fingerprint(nodes):
-    """节点列表的指纹，用于新旧对比。auth 必须参与：同 IP 换 uuid/密码是换节点，不是没更新。"""
-    return [(n["protocol"], n["server"], str(n["port"]), str(n["auth"])) for n in nodes]
+    """完整配置指纹；同端点不同认证、TLS 或传输参数不能误判为同一节点。"""
+    return sorted((node_fingerprint(n) for n in nodes), key=repr)
+
+
+def node_fingerprint(node):
+    links = node.get("links") or []
+    link_keys = sorted(k for item in links if (k := link_fingerprint(item.get("url", ""))))
+    if link_keys:
+        return (str(node.get("protocol", "")), tuple(link_keys))
+    return (str(node.get("protocol", "")), str(node.get("server", "")).lower().rstrip("."),
+            str(node.get("port", "")), str(node.get("auth", "")),
+            str(node.get("sni", "")).lower().rstrip("."), str(node.get("insecure", "")))
 
 
 # ---------- 汇总 / 去重 ----------
@@ -524,7 +534,7 @@ def aggregate_unique(refresh=False):
             errors.append(f"{TOOLS[key]['label']} 源{s}")
             continue
         for n in nodes:
-            fpk = (n["protocol"], n["server"], str(n["port"]), str(n["auth"]))
+            fpk = node_fingerprint(n)
             if fpk in seen:
                 continue
             seen.add(fpk)
@@ -545,7 +555,7 @@ def iter_unique_links(v2n_only=True):
         for n in nodes:
             if v2n_only and not n["v2n"]:
                 continue  # v2rayN 不支持的协议不进订阅，避免噪音
-            fpk = (n["protocol"], n["server"], str(n["port"]), str(n["auth"]))
+            fpk = node_fingerprint(n)
             if fpk in seen:
                 continue
             seen.add(fpk)
@@ -728,20 +738,75 @@ def build_sub_clash():
 # （QUIC 走 UDP，无法 TCP 握手测活，免检直收，挑活交给客户端 url-test 组）
 
 def _parse_link(link):
-    """分享链接 -> (scheme, host, port)，用于去重和测活。vmess 的地址在 base64 JSON 里。"""
-    scheme, _, rest = link.partition("://")
+    """分享链接 -> (scheme, host, port)，用于测活；去重使用 link_fingerprint。"""
+    scheme = link.partition("://")[0].lower()
     if scheme == "vmess":
         d = _vmess_json(link) or {}
-        return (scheme, d.get("add"), int(d.get("port") or 0)) if d.get("add") else None
+        try:
+            return (scheme, str(d.get("add", "")).lower().rstrip("."), int(d.get("port") or 0)) if d.get("add") else None
+        except (TypeError, ValueError):
+            return None
     try:
-        u = urllib.parse.urlparse(link)
+        u = urllib.parse.urlsplit(link)
         return (scheme, u.hostname, u.port) if u.hostname and u.port else None
+    except Exception:
+        return None
+
+
+def link_fingerprint(link):
+    """规范化节点的连接语义，忽略展示名但保留认证、TLS、SNI、传输和路径参数。"""
+    if not isinstance(link, str):
+        return None
+    scheme = link.partition("://")[0].lower()
+    if scheme == "vmess":
+        data = _vmess_json(link)
+        if not isinstance(data, dict) or not data.get("add"):
+            return None
+        semantic = {k: v for k, v in data.items() if k not in ("ps",)}
+        semantic["add"] = str(semantic["add"]).lower().rstrip(".")
+        try:
+            semantic["port"] = int(semantic.get("port") or 0)
+        except (TypeError, ValueError):
+            return None
+        return ("vmess", json.dumps(semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    try:
+        u = urllib.parse.urlsplit(link)
+        if not u.hostname or not u.port:
+            return None
+        host = u.hostname.lower().rstrip(".")
+        query = tuple(sorted(urllib.parse.parse_qsl(u.query, keep_blank_values=True)))
+        return (scheme, host, int(u.port), u.username or "", u.password or "", u.path, query)
     except Exception:
         return None
 
 
 def ext_cache_file(key):
     return CACHE_DIR / f"ext_{key}.json"
+
+
+def _write_json_atomic(path, data):
+    """同目录临时文件 + replace，避免并发或中断留下半截缓存。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _cache_fetched_at(data):
+    """兼容旧缓存的分钟时间戳；无法确定时间的缓存按过期处理。"""
+    value = data.get("fetched_at")
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.strptime(data.get("fetched", ""), "%Y-%m-%d %H:%M").timestamp()
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def _link_tls(link):
@@ -829,6 +894,25 @@ def _probe_link(link):
     return None
 
 
+def _decode_ext_subscription(body):
+    """解码并检查订阅响应；HTML、空响应或零条支持链接视为失败。"""
+    if not body or not body.strip():
+        raise ValueError("空响应")
+    text = body
+    if "://" not in text[:4000]:
+        compact = "".join(text.split())
+        try:
+            text = base64.b64decode(compact + "=" * (-len(compact) % 4), validate=True).decode("utf-8", "replace")
+        except Exception as e:
+            raise ValueError("响应不是有效订阅或 base64") from e
+    for line in text.splitlines():
+        line = line.strip()
+        p = _parse_link(line) if "://" in line else None
+        if p and p[0] in _EXT_SCHEMES and link_fingerprint(line):
+            return text
+    raise ValueError("响应中没有可识别的支持节点")
+
+
 def refresh_ext(key):
     """拉取一个外部源 -> 解析去重 -> 分两路处理 -> 写缓存：
     TCP 系（vmess/vless/trojan/ss）真握手测活，按延迟保留；hy1/hy2 走 UDP 无法 TCP 握手测活，
@@ -838,26 +922,29 @@ def refresh_ext(key):
     if src.get("relay"):
         chain.append((src["relay"], "wget.la镜像"))
     text, source = None, None
+    errors = []
     for i, (url, sname) in enumerate(chain):
         try:
             with open_url(url, timeout=45) as r:
-                text = r.read().decode("utf-8", errors="replace")
+                body = r.read().decode("utf-8", errors="replace")
+            text = _decode_ext_subscription(body)
             source = sname
             break
-        except Exception:
+        except Exception as e:
+            errors.append(f"{sname}: {e}")
+            text = None
             if i < len(chain) - 1:
                 time.sleep(2)
     if text is None:
-        raise RuntimeError(net_diagnosis())
-    if "://" not in text[:4000]:  # 整体 base64 的订阅
-        text = base64.b64decode(text.strip() + "=" * (-len(text.strip()) % 4)).decode("utf-8", "replace")
+        raise RuntimeError("；".join(errors) or net_diagnosis())
     total, tcp, hy1, hy2, seen = 0, [], [], [], set()
     for line in text.splitlines():
         line = line.strip()
         p = _parse_link(line) if "://" in line else None
-        if not p or p[0] not in _EXT_SCHEMES or p in seen:  # 只收面板四类槽位对应的协议
-            continue
-        seen.add(p)
+        fingerprint = link_fingerprint(line) if p and p[0] in _EXT_SCHEMES else None
+        if not p or p[0] not in _EXT_SCHEMES or not fingerprint or fingerprint in seen:
+            continue  # 只收支持的协议；完整语义相同才去重
+        seen.add(fingerprint)
         total += 1
         if p[0] == "hysteria2":
             hy2.append(line)
@@ -874,47 +961,65 @@ def refresh_ext(key):
     keep_tcp = [url for url, ms in results if ms is not None][:EXT_KEEP_TCP]
     ms_of = {url: round(ms) for url, ms in results if ms is not None}
     keep = keep_tcp + hy1[:EXT_KEEP_HY1] + hy2[:EXT_KEEP_HY2]
-    data = dict(fetched=datetime.now().strftime("%Y-%m-%d %H:%M"), source=source,
-                total=total, tcp=len(tcp), tcp_alive=len(keep_tcp),
+    if total == 0:
+        raise RuntimeError(f"{source} 未解析出支持的节点，保留上次缓存")
+    if not keep:
+        raise RuntimeError(f"{source} 本轮没有可用节点，保留上次缓存")
+    now = time.time()
+    data = dict(fetched=datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M"), fetched_at=now,
+                source=source, total=total, tcp=len(tcp), tcp_alive=len(keep_tcp),
                 hy1=min(len(hy1), EXT_KEEP_HY1), hy2=min(len(hy2), EXT_KEEP_HY2), keep=len(keep),
                 nodes=[dict(url=u, name=link_name(u), ms=ms_of.get(u)) for u in keep])
-    ext_cache_file(key).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    _write_json_atomic(ext_cache_file(key), data)
     return data
 
 
 def ext_alive():
-    """全部外部源的节点：跨源按 (协议,地址,端口) 去重；TCP 系跨源按测活延迟排序后限量，
-    hy1/hy2 免检直收分别限量。TCP 系进缓存前已真握手测活；hy1/hy2 靠客户端的 url-test 组自己挑。"""
-    tcp, hy1, hy2 = [], [], []  # tcp 元素带测活延迟 ms，跨源统一排序
-    seen = set()
+    """仅使用一天内的有效缓存；跨源重复选最新成功抓取版本，平局保持源顺序。"""
+    chosen = {}  # semantic fingerprint -> (original position, fetched_at, node, fetched text)
+    position = 0
+    now = time.time()
     for key in EXT_SOURCES:
         f = ext_cache_file(key)
         if not f.exists():
             continue
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
+            fetched_at = _cache_fetched_at(d)
+            if fetched_at is None or now - fetched_at > EXT_CACHE_MAX_AGE_SECONDS or fetched_at > now + 300:
+                continue
         except Exception:
             continue
         for n in d.get("nodes", []):
-            p = _parse_link(n["url"])
-            if not p or p[0] not in _EXT_SCHEMES or p in seen:  # 协议过滤兜底：旧版缓存只存了别的协议也不放行
+            if not isinstance(n, dict):
                 continue
-            seen.add(p)
-            if p[0] == "hysteria2":
-                hy2.append((n["url"], n["name"], d.get("fetched", "")))
-            elif p[0] == "hysteria":
-                hy1.append((n["url"], n["name"], d.get("fetched", "")))
-            else:
-                tcp.append((n["url"], n["name"], d.get("fetched", "")))
-    # 跨源去重后平权保留（不再按延迟排序截断，延迟只作展示），避免远距离的高延迟优质节点被挤掉
-    return (tcp[:EXT_KEEP_TCP] + hy1[:EXT_KEEP_HY1] + hy2[:EXT_KEEP_HY2])
+            url = n.get("url", "")
+            p = _parse_link(url)
+            fingerprint = link_fingerprint(url)
+            if not p or p[0] not in _EXT_SCHEMES or not fingerprint:
+                continue  # 协议与格式过滤兜底
+            previous = chosen.get(fingerprint)
+            if previous is None or fetched_at > previous[1]:
+                chosen[fingerprint] = (position, fetched_at, n, d.get("fetched", ""))
+            position += 1
+    tcp, hy1, hy2 = [], [], []
+    for _, _, n, fetched in sorted(chosen.values(), key=lambda item: item[0]):
+        p = _parse_link(n["url"])
+        item = (n["url"], n.get("name") or link_name(n["url"]), fetched)
+        if p[0] == "hysteria2":
+            hy2.append(item)
+        elif p[0] == "hysteria":
+            hy1.append(item)
+        else:
+            tcp.append(item)
+    return tcp[:EXT_KEEP_TCP] + hy1[:EXT_KEEP_HY1] + hy2[:EXT_KEEP_HY2]
 
 
 def refresh_ext_all(background=True):
     """刷新全部外部源。默认后台跑，**四个源并行**（各自下载 + 真握手测活，总耗时约等于最慢
     的一个源，通常一分多钟），立即返回。已在刷新时直接跳过。"""
     global EXT_REFRESHING
-    if EXT_REFRESHING:
+    if not _EXT_REFRESH_LOCK.acquire(blocking=False):
         return False
     EXT_REFRESHING = True
 
@@ -934,6 +1039,7 @@ def refresh_ext_all(background=True):
                 list(ex.map(refresh_one, EXT_SOURCES))
         finally:
             EXT_REFRESHING = False
+            _EXT_REFRESH_LOCK.release()
 
     if background:
         threading.Thread(target=work, daemon=True).start()
@@ -1002,12 +1108,17 @@ class Handler(BaseHTTPRequestHandler):
                 f = ext_cache_file(key)
                 try:
                     d = json.loads(f.read_text(encoding="utf-8"))
+                    fetched_at = _cache_fetched_at(d)
+                    age = max(0, int(time.time() - fetched_at)) if fetched_at is not None else None
+                    stale = (fetched_at is None or age > EXT_CACHE_MAX_AGE_SECONDS
+                             or fetched_at > time.time() + 300)
                     info.update(fetched=d.get("fetched"), total=d.get("total"),
                                 tcp=d.get("tcp", 0), tcp_alive=d.get("tcp_alive", 0),
                                 hy1=d.get("hy1", 0), hy2=d.get("hy2", 0),
-                                keep=len(d.get("nodes", [])))
+                                keep=len(d.get("nodes", [])), age_seconds=age, stale=stale)
                 except Exception:
-                    info.update(fetched=None, total=None, tcp=0, tcp_alive=0, hy1=0, hy2=0, keep=0)
+                    info.update(fetched=None, total=None, tcp=0, tcp_alive=0, hy1=0, hy2=0,
+                                keep=0, age_seconds=None, stale=True)
                 info["failed_at"] = (datetime.fromtimestamp(EXT_ATTEMPT[key]).strftime("%H:%M")
                                      if key in EXT_ATTEMPT else None)  # 失败原因属于哪一轮，避免旧失败记录误导
                 info["error"] = EXT_ERRORS.get(key)
