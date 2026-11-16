@@ -144,7 +144,7 @@
 
 <header class="hero">
   <div class="wrap">
-    <div class="badge">⚡ 本地运行 · 数据不出你的电脑</div>
+    <div class="badge" id="localityBadge">⚡ 本地运行 · 数据不出你的电脑</div>
     <h1>ChromeGo <em>节点面板</em></h1>
     <p>打开就能用：面板把两类来源（ChromeGo 节点池 · 外部公共源）的免费节点拉好、去掉重复的，你只要把订阅地址粘进 v2rayN / Clash，客户端会自己挑能用的节点。</p>
   </div>
@@ -159,7 +159,7 @@
       <code id="subUrl">（启动后自动生成，含访问密钥）</code>
       <button class="copy" id="subCopy" data-copy="">复制</button>
     </div>
-    <p class="desc" style="margin:6px 0 0; color:#b91c1c">🔒 订阅地址里带访问密钥，只填到你自己的客户端里，<strong>不要发给别人</strong>——地址外传等于节点全泄；老地址 <code>/sub</code> 已停用</p>
+    <p class="desc" id="subPrivacyNotice" style="margin:6px 0 0; color:#b91c1c">🔒 订阅地址里带访问密钥，只填到你自己的客户端里，<strong>不要发给别人</strong>——地址外传等于节点全泄；老地址 <code>/sub</code> 已停用</p>
   </div>
 
   <div class="panel" id="cgPanel">
@@ -452,6 +452,15 @@ async function stopSpeedTest() {
   } catch (e) { document.getElementById('speedStatus').textContent = `停止请求失败：${e}`; }
 }
 
+function updateAccessNotice() {
+  const host = location.hostname.toLowerCase();
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(host) || host.endsWith('.localhost');
+  if (isLocal) return;
+  document.getElementById('localityBadge').textContent = '⚠️ 临时公网访问 · 知道链接的人都可访问';
+  document.getElementById('subPrivacyNotice').textContent = '⚠️ 这是免登录的公网面板：任何拿到面板链接的人都能查看并获取节点订阅。请勿公开转发；停止面板或临时隧道即可关闭访问。';
+}
+
+updateAccessNotice();
 loadTools();
 loadExt();
 loadSpeedtest();
