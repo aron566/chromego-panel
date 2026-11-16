@@ -10,6 +10,9 @@ proxy.json
 # 本机订阅访问密钥（每台电脑不一样，不入库）
 sub.json
 
+# 本机测速白名单，含通过节点的分享链接（不入库）
+speedtest.json
+
 # Python
 __pycache__/
 *.pyc

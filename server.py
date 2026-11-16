@@ -38,7 +38,7 @@ SPEEDTEST_CANCEL = threading.Event()
 SPEEDTEST_BYTES = 1024 * 1024  # 每个节点下载 1 MiB，避免测速意外消耗大量流量
 SPEEDTEST_FILE_URL = "https://fsn1-speed.hetzner.com/100MB.bin"
 SPEEDTEST_STATE = dict(running=False, phase="idle", total=0, completed=0,
-                       current="", skipped=0, results=[], error="")
+                       current="", skipped=0, excluded=0, results=[], error="")
 
 # 外部公共订阅源（2026-10-31 逐个实测筛出，兼顾协议互补与更新时段）
 # mirror 是 jsDelivr CDN 兜底，relay 是 wget.la 反代镜像——国内不开代理也能直连
@@ -104,6 +104,31 @@ else:
     ASSET_DIR = PANEL_DIR = Path(__file__).resolve().parent
 CACHE_DIR = PANEL_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+SPEEDTEST_FILE = PANEL_DIR / "speedtest.json"
+SPEEDTEST_LAST = dict(tested_at=None, total=0, completed=0, skipped=0, excluded=0, results=[])
+
+
+def _load_saved_speedtest():
+    """读取上次完整测速；文件只在本机保存，含通过节点的原始分享链接。"""
+    try:
+        data = json.loads(SPEEDTEST_FILE.read_text(encoding="utf-8"))
+        results = [r for r in data.get("results", [])
+                   if isinstance(r, dict) and r.get("status") in ("ok", "connected")
+                   and isinstance(r.get("url"), str) and "://" in r["url"]]
+        SPEEDTEST_LAST.update(
+            tested_at=data.get("tested_at"), total=int(data.get("total", len(results))),
+            completed=int(data.get("completed", len(results))),
+            skipped=int(data.get("skipped", 0)), excluded=int(data.get("excluded", 0)),
+            results=results)
+        if SPEEDTEST_LAST["total"]:
+            SPEEDTEST_STATE.update(running=False, phase="complete", total=SPEEDTEST_LAST["total"],
+                                   completed=SPEEDTEST_LAST["completed"], skipped=SPEEDTEST_LAST["skipped"],
+                                   excluded=SPEEDTEST_LAST["excluded"], results=list(results), current="")
+    except Exception:
+        pass
+
+
+_load_saved_speedtest()
 
 PORT = 8765
 GITLAB_TPL = ("https://gitlab.com/free9999/ipupdate/-/raw/master"
@@ -586,9 +611,44 @@ def iter_unique_links(v2n_only=True):
         yield url, name
 
 
+def _speedtest_name(name, result):
+    speed = result.get("speed_mbps")
+    latency = result.get("latency_ms")
+    speed_text = f"{float(speed):.2f} Mbps" if speed is not None else "下载通过"
+    latency_text = f"{int(latency)} ms" if latency is not None else "延迟未知"
+    return f"{name} [{speed_text} · {latency_text}]"
+
+
+def _rename_link(url, name):
+    """将新节点名写回分享链接（VMess 的 ps 在 base64 JSON 内）。"""
+    base = url.split("#", 1)[0]
+    if base.startswith("vmess://"):
+        data = _vmess_json(base)
+        if data is not None:
+            data["ps"] = name
+            body = base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()).decode()
+            base = "vmess://" + body.rstrip("=")
+    return base + "#" + urllib.parse.quote(name, safe="")
+
+
+def iter_tested_links(v2n_only=True):
+    """只返回上次完整测试中下载样本成功的链接，并将实测结果追加到名称。"""
+    with SPEEDTEST_LOCK:
+        passed = {r.get("url"): dict(r) for r in SPEEDTEST_LAST["results"]
+                  if r.get("status") == "ok" and r.get("url") and r.get("speed_mbps") is not None}
+    if not passed:
+        return
+    for url, name in iter_unique_links(v2n_only=v2n_only):
+        result = passed.get(url)
+        if result:
+            original_name = link_name(url)
+            tested_name = _speedtest_name(original_name if original_name != "节点" else name, result)
+            yield _rename_link(url, tested_name), tested_name, result
+
+
 def build_sub():
-    """v2rayN 订阅（base64 分享链接列表）。"""
-    urls = [url for url, _ in iter_unique_links()]
+    """v2rayN 订阅：只包含完整下载测速通过的节点，名称附实测速率和延迟。"""
+    urls = [url for url, _, _ in iter_tested_links()]
     return base64.b64encode("\n".join(urls).encode()).decode()
 
 
@@ -724,13 +784,11 @@ def _clash_proxy(url, name):
 
 
 def build_sub_clash():
-    """Clash / Mihomo 订阅（YAML）。比 base64 订阅多收 hysteria v1。
+    """Clash / Mihomo 订阅（YAML），只含完整下载测速通过的节点。
 
-    分两层：`精选`只放真握手验证过的 TCP 系节点（trojan / vless-tls / vmess-tls），默认走它；
-    `全部`包含所有节点（含免检的 hy、仅 TCP 连通的 ss）。免费节点死得快，让 url-test 自己挑活的。"""
+    节点名带实测速率和延迟；`精选`再从测速通过节点中挑 TLS 握手成功的 TCP 节点。"""
     proxies, names, taken, verified = [], [], set(), []
-    for url, _ in iter_unique_links(v2n_only=False):
-        base = link_name(url)
+    for url, base, _ in iter_tested_links(v2n_only=False):
         name, i = base, 2
         while name in taken:
             name = f"{base} {i}"
@@ -1157,14 +1215,34 @@ def _speedtest_sort_key(row):
             row.get("name", "").casefold())
 
 
+def _save_speedtest_last():
+    with SPEEDTEST_LOCK:
+        data = dict(SPEEDTEST_LAST)
+        data["results"] = [dict(r) for r in SPEEDTEST_LAST["results"]]
+    tmp = SPEEDTEST_FILE.with_name(f"{SPEEDTEST_FILE.name}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, SPEEDTEST_FILE)
+    except Exception as e:
+        print(f"测速结果未能写入本机缓存：{type(e).__name__}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def speedtest_snapshot():
     """返回不含分享链接/认证信息的测速状态，结果按下载速度从高到低排列。"""
     with SPEEDTEST_LOCK:
         data = dict(SPEEDTEST_STATE)
         safe_fields = ("name", "protocol", "status", "latency_ms", "speed_mbps", "downloaded_bytes", "error")
         rows = [{key: row.get(key) for key in safe_fields} for row in SPEEDTEST_STATE["results"]]
-        data["excluded"] = sum(row.get("status") == "failed" for row in rows)
+        data["excluded"] = max(data.get("excluded", 0), sum(row.get("status") == "failed" for row in rows))
         data["results"] = sorted((row for row in rows if row.get("status") != "failed"), key=_speedtest_sort_key)
+        data["connected_only"] = sum(row.get("status") == "connected" for row in rows)
+        data["subscription_nodes"] = sum(r.get("status") == "ok" for r in SPEEDTEST_LAST["results"])
+        data["tested_at"] = SPEEDTEST_LAST.get("tested_at")
+        data["has_complete_test"] = bool(SPEEDTEST_LAST.get("total"))
         return data
 
 
@@ -1181,14 +1259,25 @@ def _speedtest_worker(nodes, binary):
                 result = dict(name=name, protocol=url.partition(":")[0], status="failed",
                               latency_ms=None, speed_mbps=None, downloaded_bytes=0,
                               error="连接测试失败")
+            result["url"] = url
             with SPEEDTEST_LOCK:
                 SPEEDTEST_STATE["results"].append(result)
                 SPEEDTEST_STATE["completed"] = index
                 SPEEDTEST_STATE["current"] = ""
+        complete = not SPEEDTEST_CANCEL.is_set()
         with SPEEDTEST_LOCK:
-            SPEEDTEST_STATE.update(running=False,
-                                   phase="stopped" if SPEEDTEST_CANCEL.is_set() else "complete",
-                                   current="")
+            failed = sum(r.get("status") == "failed" for r in SPEEDTEST_STATE["results"])
+            SPEEDTEST_STATE.update(running=False, phase="complete" if complete else "stopped",
+                                   excluded=failed, current="")
+            if complete:
+                SPEEDTEST_LAST.update(
+                    tested_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                    total=SPEEDTEST_STATE["total"], completed=SPEEDTEST_STATE["completed"],
+                    skipped=SPEEDTEST_STATE["skipped"], excluded=failed,
+                    results=[dict(r) for r in SPEEDTEST_STATE["results"]
+                             if r.get("status") in ("ok", "connected")])
+        if complete:
+            _save_speedtest_last()
     except Exception as e:
         with SPEEDTEST_LOCK:
             SPEEDTEST_STATE.update(running=False, phase="error", current="",
@@ -1225,7 +1314,7 @@ def start_speedtest():
             return False, "正在测速，请稍候"
         SPEEDTEST_CANCEL.clear()
         SPEEDTEST_STATE.update(running=True, phase="starting", total=len(nodes), completed=0,
-                               current="", skipped=skipped, results=[], error="")
+                               current="", skipped=skipped, excluded=0, results=[], error="")
         threading.Thread(target=_speedtest_worker, args=(nodes, binary), daemon=True).start()
     return True, f"已开始逐条测试 {len(nodes)} 个节点"
 

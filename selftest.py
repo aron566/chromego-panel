@@ -118,16 +118,30 @@ server.EXT_KEEP_HY1, server.EXT_KEEP_HY2 = 20, 60
 urls = [u for u, _, _ in server.ext_alive()]
 assert "hysteria2://auth@3.3.3.3:443?sni=s.com#h2c" in urls  # 名额够时各源 hy2 都进
 
-# 两种订阅格式（外部源 8 条，其中 hy1 只进 Clash 不进 v2rayN）
-assert base64.b64decode(server.build_sub()).decode().count("://") == 7
+# 订阅只保留完整下载通过的节点，名称附下载速率和延迟。
+all_links = list(server.iter_unique_links(v2n_only=False))
+server.SPEEDTEST_LAST.update(tested_at="test", total=len(all_links), completed=len(all_links),
+    skipped=0, excluded=0, results=[dict(url=u, name=n, protocol=u.partition(":")[0], status="ok",
+        latency_ms=80, speed_mbps=3.0, downloaded_bytes=server.SPEEDTEST_BYTES) for u, n in all_links])
+v2n_sub = base64.b64decode(server.build_sub()).decode()
+assert v2n_sub.count("://") == 7  # 外部源 8 条，其中 hy1 只进 Clash
+assert any(server.link_name(line).endswith("[3.00 Mbps · 80 ms]") for line in v2n_sub.splitlines())
 cfg = yaml.safe_load(server.build_sub_clash())
 assert [g["name"] for g in cfg["proxy-groups"]] == [
     "chromego-panel", "自动-精选", "自动-全部", "精选", "全部"]
 assert [g["type"] for g in cfg["proxy-groups"]] == ["select", "url-test", "url-test", "select", "select"]
 assert len(cfg["proxies"]) == 8
 picked = next(g for g in cfg["proxy-groups"] if g["name"] == "精选")
-assert set(picked["proxies"]) == {"名", "tr", "tr2"}  # 只有 TLS 真握手的进精选；ss/hy 只留在全部
+assert set(picked["proxies"]) == {"名 [3.00 Mbps · 80 ms]", "tr [3.00 Mbps · 80 ms]",
+                                   "tr2 [3.00 Mbps · 80 ms]"}  # 只有 TLS 真握手的节点才进精选
 assert cfg["proxy-groups"][0]["proxies"][:2] == ["自动-精选", "自动-全部"]  # 默认走精选的自动组
+
+# 只通过连接探测、下载未通过的节点不能进入任何一种订阅。
+ss_url = next(u for u, _ in all_links if u.startswith("ss://"))
+server.SPEEDTEST_LAST["results"] = [dict(r, status="connected") if r["url"] == ss_url else r
+                                     for r in server.SPEEDTEST_LAST["results"]]
+assert not any(line.startswith("ss://") for line in base64.b64decode(server.build_sub()).decode().splitlines())
+assert len(yaml.safe_load(server.build_sub_clash())["proxies"]) == 7
 
 # 测速工作器逐个处理节点；即使结果完成顺序固定，也按下载速度降序展示。
 tested = []
@@ -141,13 +155,18 @@ def fake_speedtest_one(binary, url, name):
                 downloaded_bytes=server.SPEEDTEST_BYTES, error="")
 server._speedtest_one = fake_speedtest_one
 server.SPEEDTEST_CANCEL.clear()
+server.SPEEDTEST_FILE = pathlib.Path(tempfile.mkdtemp()) / "speedtest.json"
 server.SPEEDTEST_STATE.update(running=True, phase="starting", total=3, completed=0,
-                              current="", skipped=0, results=[], error="")
+                              current="", skipped=0, excluded=0, results=[], error="")
 server._speedtest_worker([("link-a", "slow"), ("link-dead", "dead"),
                           ("link-b", "fast")], "fake-mihomo")
 assert tested == ["slow", "dead", "fast"]
 assert server.SPEEDTEST_STATE["phase"] == "complete"
 assert server.SPEEDTEST_STATE["results"][1]["status"] == "failed"
+saved = json.loads(server.SPEEDTEST_FILE.read_text())
+assert len(saved["results"]) == 2 and all(r["status"] == "ok" for r in saved["results"])
+assert all(r["url"] != "link-dead" for r in saved["results"])
+assert base64.b64decode(server.build_sub()) == b""  # 旧的通过结果不匹配当前节点时不会误放行
 server._speedtest_one = original_speedtest_one
 
 # 不可连接节点被剔除出面向浏览器的结果；即使内部误带链接字段也不能泄漏认证信息。

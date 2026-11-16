@@ -153,8 +153,8 @@
 <main class="wrap">
   <div id="warmTip" hidden style="background:rgba(124,58,237,.07); border:1px solid rgba(124,58,237,.2); border-radius:12px; padding:10px 16px; margin-bottom:14px; font-size:13px; color:var(--accent)">⏳ 第一次启动，正在后台把所有源先拉一遍，稍等一下，订阅数据马上就好…</div>
   <div class="panel" id="subPanel">
-    <h2>📮 订阅地址 · 全部来源合并去重</h2>
-    <p class="desc">来源一、来源二的节点统一合进这一个订阅地址，重复的自动去掉。客户端填一次就行（v2rayN：订阅 → 添加订阅），想取最新就在客户端点「更新订阅」：</p>
+    <h2>📮 订阅地址 · 测速通过的节点</h2>
+    <p class="desc">订阅只包含最近一次完整测速中成功下载样本的节点，节点名附有实测速率和延迟。更新节点来源后，未通过测速的新节点不会进入订阅；测速完成后客户端点「更新订阅」即可：</p>
     <div class="linkrow">
       <code id="subUrl">（启动后自动生成，含访问密钥）</code>
       <button class="copy" id="subCopy" data-copy="">复制</button>
@@ -192,7 +192,7 @@
 
   <div class="panel" id="speedPanel">
     <h2>节点测速 · 按下载速度排序</h2>
-    <p class="desc">逐个读取当前订阅里的节点，用 Mihomo 单独连接测试 HTTPS 响应延迟和下载速度。每个节点最多下载 1 MiB；节点较多时会花较久，并产生相应流量。结果只保存在本次运行内存中。</p>
+    <p class="desc">逐个读取当前节点，用 Mihomo 单独连接测试 HTTPS 响应延迟和下载速度。只有成功下载测速样本的节点会进入订阅，名称会附上实测速率与延迟。每个节点最多下载 1 MiB；完整结果保存在本机，重启后仍有效；中途停止不会覆盖上一次完整结果。</p>
     <p class="why" style="margin-bottom:12px">需要你已安装 Mihomo 内核（命令名为 <code>mihomo</code>），并加入 PATH，或放在 ChromeGo 程序同目录。面板不会自动下载内核。测试通过每个节点访问 Cloudflare 探测页和 Hetzner 官方测速文件。</p>
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
       <button class="btn btn2" id="speedBtn" onclick="doSpeedTest()">测速当前订阅</button>
@@ -401,15 +401,20 @@ function renderSpeedtest(d) {
       ? `正在结束当前节点（${d.completed}/${d.total}）`
       : `进度 ${d.completed}/${d.total}${current}`;
   } else if (d.phase === 'complete') {
-    status.textContent = `完成：${d.completed}/${d.total} · 可连接 ${d.results.length} · 剔除无法连接 ${d.excluded || 0}${d.skipped ? ` · 跳过 ${d.skipped} 个不支持的节点` : ''}`;
+    const passed = (d.results || []).filter(r => r.status === 'ok').length;
+    status.textContent = `完成：${d.completed}/${d.total} · 下载测速通过 ${passed} · 仅连通但下载失败 ${d.connected_only || 0} · 探测失败 ${d.excluded || 0}${d.skipped ? ` · 跳过 ${d.skipped} 个不支持的节点` : ''}`;
   } else if (d.phase === 'stopped') {
-    status.textContent = `已停止：完成 ${d.completed}/${d.total} · 可连接 ${d.results.length} · 剔除无法连接 ${d.excluded || 0}`;
+    status.textContent = `已停止：完成 ${d.completed}/${d.total} · 本轮下载通过 ${(d.results || []).filter(r => r.status === 'ok').length}；订阅仍使用上一轮完整测速结果`;
   } else if (d.phase === 'error') {
     status.textContent = d.error || '测速中断';
+  } else if (d.has_complete_test) {
+    status.textContent = `订阅筛选已启用：${d.subscription_nodes || 0} 个下载测速通过节点`;
+  } else {
+    status.textContent = '尚无完整测速结果；完成测速前订阅不会输出节点';
   }
 
   const rows = (d.results || []).map((r, i) => {
-    const state = r.status === 'ok' ? '<span class="pill ok">已测</span>'
+    const state = r.status === 'ok' ? '<span class="pill ok">下载通过</span>'
       : r.status === 'connected' ? '<span class="pill mid">已连通</span>'
       : '<span class="pill no">未连通</span>';
     const speed = r.speed_mbps == null ? '—' : `${Number(r.speed_mbps).toFixed(2)} Mbps`;
