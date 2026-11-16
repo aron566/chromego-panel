@@ -193,7 +193,7 @@
   <div class="panel" id="speedPanel">
     <h2>节点测速 · 按下载速度排序</h2>
     <p class="desc">逐个读取当前订阅里的节点，用 Mihomo 单独连接测试 HTTPS 响应延迟和下载速度。每个节点最多下载 1 MiB；节点较多时会花较久，并产生相应流量。结果只保存在本次运行内存中。</p>
-    <p class="why" style="margin-bottom:12px">需要你已安装 Mihomo 内核（命令名为 <code>mihomo</code>），并加入 PATH，或放在 ChromeGo 程序同目录。面板不会自动下载内核。测试会通过每个节点访问 Cloudflare 的探测页和测速页。</p>
+    <p class="why" style="margin-bottom:12px">需要你已安装 Mihomo 内核（命令名为 <code>mihomo</code>），并加入 PATH，或放在 ChromeGo 程序同目录。面板不会自动下载内核。测试通过每个节点访问 Cloudflare 探测页和 Hetzner 官方测速文件。</p>
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
       <button class="btn btn2" id="speedBtn" onclick="doSpeedTest()">测速当前订阅</button>
       <button class="copy" id="speedStopBtn" onclick="stopSpeedTest()" disabled>停止测速</button>

@@ -30,6 +30,26 @@ assert server._clash_proxy("naive+https://u:p@h:443#x", "n") is None  # mihomo �
 assert server._clash_proxy(vm(dict(add="1.2.3.4", port="80", net="http", path="/p")), "n")["network"] == "http"
 assert server._clash_proxy(vm(dict(add="1.2.3.4", port="443", tls=True, net="tcp", ps="t")), "n")["tls"] is True
 
+# Cloudflare trace 对 HEAD 返回 403；测速应使用 GET 并限制读取响应体。
+class FakeProbeResponse:
+    status = 200
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self, limit):
+        assert limit == 128
+        return b"ok"
+
+class FakeProbeOpener:
+    def open(self, request, timeout):
+        assert request.get_method() == "GET"
+        assert timeout == 8
+        return FakeProbeResponse()
+
+assert server._speedtest_probe_latency(FakeProbeOpener()) >= 0
+download_request = server._speedtest_download_request()
+assert download_request.full_url == server.SPEEDTEST_FILE_URL
+assert download_request.get_header("Range") == f"bytes=0-{server.SPEEDTEST_BYTES - 1}"
+
 # 同 IP 换 uuid 算换节点
 a = server._mk_node("vless", "1.2.3.4", 443, "id-a", "", None, [], "")
 b = server._mk_node("vless", "1.2.3.4", 443, "id-b", "", None, [], "")

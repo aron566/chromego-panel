@@ -36,6 +36,7 @@ EXT_ATTEMPT = {}        # 源 key -> 最近一次拉取尝试的时间戳（失�
 SPEEDTEST_LOCK = threading.Lock()
 SPEEDTEST_CANCEL = threading.Event()
 SPEEDTEST_BYTES = 1024 * 1024  # 每个节点下载 1 MiB，避免测速意外消耗大量流量
+SPEEDTEST_FILE_URL = "https://fsn1-speed.hetzner.com/100MB.bin"
 SPEEDTEST_STATE = dict(running=False, phase="idle", total=0, completed=0,
                        current="", skipped=0, results=[], error="")
 
@@ -1051,6 +1052,26 @@ def _wait_for_mihomo(proc, port, timeout=10):
     raise TimeoutError("Mihomo 本地测速代理启动超时")
 
 
+def _speedtest_probe_latency(opener):
+    """用 GET 探测 Cloudflare trace；该端点对 HEAD 返回 403。"""
+    started = time.perf_counter()
+    request = urllib.request.Request("https://www.cloudflare.com/cdn-cgi/trace", method="GET")
+    with opener.open(request, timeout=8) as response:
+        if response.status >= 400:
+            raise OSError("探测站返回错误")
+        response.read(128)
+    return round((time.perf_counter() - started) * 1000)
+
+
+def _speedtest_download_request():
+    """请求 Hetzner 官方测速文件的 1 MiB 范围，避免拉取整个 100 MB 文件。"""
+    return urllib.request.Request(
+        SPEEDTEST_FILE_URL,
+        headers={"Cache-Control": "no-cache",
+                 "Range": f"bytes=0-{SPEEDTEST_BYTES - 1}"},
+    )
+
+
 def _speedtest_one(binary, url, name):
     """用单独的 Mihomo 进程测试一个订阅节点；函数返回前一定关闭该进程。"""
     proxy_name = "ChromeGo-Speedtest"
@@ -1092,21 +1113,13 @@ def _speedtest_one(binary, url, name):
             )
 
             # 先通过当前节点访问 Cloudflare 轻量探测地址，记录完整请求往返延迟。
-            started = time.perf_counter()
-            with opener.open(urllib.request.Request("https://www.cloudflare.com/cdn-cgi/trace", method="HEAD"),
-                             timeout=8) as response:
-                if response.status >= 400:
-                    raise OSError("探测站返回错误")
-            result["latency_ms"] = round((time.perf_counter() - started) * 1000)
+            result["latency_ms"] = _speedtest_probe_latency(opener)
             result["status"] = "connected"
             result["error"] = "下载测速失败"
 
             # 通过同一条节点下载固定 1 MiB 样本，按实际接收字节数计算有效速率。
             started = time.perf_counter()
-            request = urllib.request.Request(
-                f"https://speed.cloudflare.com/__down?bytes={SPEEDTEST_BYTES}",
-                headers={"Cache-Control": "no-cache"},
-            )
+            request = _speedtest_download_request()
             with opener.open(request, timeout=20) as response:
                 if response.status >= 400:
                     raise OSError("测速站返回错误")
