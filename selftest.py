@@ -102,11 +102,43 @@ assert "hysteria2://auth@3.3.3.3:443?sni=s.com#h2c" in urls  # 名额够时各�
 assert base64.b64decode(server.build_sub()).decode().count("://") == 7
 cfg = yaml.safe_load(server.build_sub_clash())
 assert [g["name"] for g in cfg["proxy-groups"]] == [
-    "freeproxy-panel", "自动-精选", "自动-全部", "精选", "全部"]
+    "chromego-panel", "自动-精选", "自动-全部", "精选", "全部"]
 assert [g["type"] for g in cfg["proxy-groups"]] == ["select", "url-test", "url-test", "select", "select"]
 assert len(cfg["proxies"]) == 8
 picked = next(g for g in cfg["proxy-groups"] if g["name"] == "精选")
 assert set(picked["proxies"]) == {"名", "tr", "tr2"}  # 只有 TLS 真握手的进精选；ss/hy 只留在全部
 assert cfg["proxy-groups"][0]["proxies"][:2] == ["自动-精选", "自动-全部"]  # 默认走精选的自动组
+
+# 测速工作器逐个处理节点；即使结果完成顺序固定，也按下载速度降序展示。
+tested = []
+original_speedtest_one = server._speedtest_one
+def fake_speedtest_one(binary, url, name):
+    tested.append(name)
+    if name == "dead":
+        raise RuntimeError("fake node failure")
+    return dict(name=name, protocol="vless", status="ok", latency_ms=80,
+                speed_mbps=3.0 if name == "slow" else 12.0,
+                downloaded_bytes=server.SPEEDTEST_BYTES, error="")
+server._speedtest_one = fake_speedtest_one
+server.SPEEDTEST_CANCEL.clear()
+server.SPEEDTEST_STATE.update(running=True, phase="starting", total=3, completed=0,
+                              current="", skipped=0, results=[], error="")
+server._speedtest_worker([("link-a", "slow"), ("link-dead", "dead"),
+                          ("link-b", "fast")], "fake-mihomo")
+assert tested == ["slow", "dead", "fast"]
+assert server.SPEEDTEST_STATE["phase"] == "complete"
+assert server.SPEEDTEST_STATE["results"][1]["status"] == "failed"
+server._speedtest_one = original_speedtest_one
+
+# 不可连接节点被剔除出面向浏览器的结果；即使内部误带链接字段也不能泄漏认证信息。
+server.SPEEDTEST_STATE.update(running=False, phase="complete", total=3, completed=3,
+    results=[dict(name="slow", protocol="ss", status="ok", latency_ms=80, speed_mbps=3.0),
+             dict(name="dead", protocol="vless", status="failed", latency_ms=None,
+                  speed_mbps=None, url="vless://secret@example.invalid:443"),
+             dict(name="fast", protocol="vless", status="ok", latency_ms=120, speed_mbps=12.0)])
+snapshot = server.speedtest_snapshot()
+assert snapshot["excluded"] == 1
+assert [r["name"] for r in snapshot["results"]] == ["fast", "slow"]
+assert all("url" not in r for r in snapshot["results"])
 
 print("selftest OK")

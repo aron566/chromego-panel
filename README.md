@@ -1,4 +1,4 @@
-# FreeProxy 节点面板
+# ChromeGo 节点面板
 
 本地 Web 工具：拉取 ChromeGo 免费节点池各槽位的配置，解析成 v2rayN 可直接导入的分享链接和订阅，支持新旧配置对比与全槽位去重汇总。数据只落在本地 `cache/`。
 
@@ -8,10 +8,10 @@
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| Windows | `FreeProxyPanel-windows-x64.exe` | SmartScreen 首次提示"未知发布者"时点「更多信息 → 仍要运行」 |
-| macOS (Intel) | `FreeProxyPanel-macos-x64.zip` | 解压后双击使用；若提示"已损坏/无法验证"，终端执行 `xattr -d com.apple.quarantine FreeProxyPanel-macos-x64` 再双击 |
-| macOS (Apple Silicon) | `FreeProxyPanel-macos-arm64.zip` | 同上 |
-| Linux | `FreeProxyPanel-linux-x64` | `chmod +x` 后运行；CentOS 7+ / Ubuntu 18.04+ / Debian 10+ 通用 |
+| Windows | `ChromeGoPanel-windows-x64.exe` | SmartScreen 首次提示"未知发布者"时点「更多信息 → 仍要运行」 |
+| macOS (Intel) | `ChromeGoPanel-macos-x64.zip` | 解压后双击使用；若提示"已损坏/无法验证"，终端执行 `xattr -d com.apple.quarantine ChromeGoPanel-macos-x64` 再双击 |
+| macOS (Apple Silicon) | `ChromeGoPanel-macos-arm64.zip` | 同上 |
+| Linux | `ChromeGoPanel-linux-x64` | `chmod +x` 后运行；CentOS 7+ / Ubuntu 18.04+ / Debian 10+ 通用 |
 
 `cache/`、`proxy.json` 等数据始终生成在程序文件旁边，升级时换个新文件即可，数据不丢。
 
@@ -32,6 +32,12 @@ python server.py
 
 仅 Python 标准库 + PyYAML（解析 Clash.Meta 槽位的 YAML 配置），无其他第三方包。
 
+## 节点测速
+
+面板里的「测速当前订阅」会按订阅中的顺序逐个启动单节点代理，通过 Cloudflare 测 HTTPS 响应延迟并下载最多 1 MiB 样本；结果按下载速率从高到低排列。无法连通的节点不会出现在结果列表中，面板会汇报剔除数量；原订阅和缓存不会被修改。任务只由用户手动启动，结果仅保存在本次运行内存中。
+
+测速需要本机已有 Mihomo 内核（命令名 `mihomo`），加入 `PATH` 或放在 ChromeGo 程序同目录即可。面板不会自动下载内核。每个节点都会产生少量网络流量，节点较多时测速会持续较久；可在面板停止后续测试。
+
 ## 说明
 
 - 启动时后台预热槽位缓存（`cache/` 是运行时产物，不入库）。云端每个「源N」是固定地址，内容由作者不定期整批覆盖，拉到的永远是当下最新配置，隔几天重拉一次更稳
@@ -39,7 +45,7 @@ python server.py
 - **外部源三条拉取链路**：GitHub raw → jsDelivr → wget.la 国内反代镜像，逐条尝试。前两条国内直连不通，第三条不开代理也能拉
 - **代理只在面板「代理地址」框配置**（存 `proxy.json`，不入库）：填了就只走它（用前真连验证一次，代理进程活着但节点挂了会被识破），失败自动落到直连 + 镜像；留空不做任何代理尝试。只认 HTTP 代理（v2rayN 10808、Clash 7890 都是混合端口，直接填）
 - **开代理软件 ≠ 开系统代理**：打开代理软件是在本机开一个代理端口（如 127.0.0.1:10808），等请求主动送进来；「系统代理」开关只是改 Windows 的一条全局设置，给浏览器这类"会来读设置"的程序看。面板不读系统代理设置，只认上面填的地址——决定能不能借道的只有两件事：端口活着、节点真能通
-- Clash 订阅分了「精选 / 全部」两层，都在 `freeproxy-panel` 组里：`精选` 只放真握手验证过的 TCP 系节点（默认走 `自动-精选`），`全部` 含免检的 hy 和仅端口连通的节点（`自动-全部`）。两个 url-test 组都是 2 分钟测一次、`lazy` 只在被选中时测，客户端自动切到还活的节点，不用手删
+- Clash 订阅分了「精选 / 全部」两层，都在 `chromego-panel` 组里：`精选` 只放真握手验证过的 TCP 系节点（默认走 `自动-精选`），`全部` 含免检的 hy 和仅端口连通的节点（`自动-全部`）。两个 url-test 组都是 2 分钟测一次、`lazy` 只在被选中时测，客户端自动切到还活的节点，不用手删
 
 ## 使用建议
 

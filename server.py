@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FreeProxy 节点面板 — 本地 Web 工具
+ChromeGo 节点面板 — 本地 Web 工具
 拉取免费节点池的槽位配置 -> 新旧对比 -> 生成 v2rayN 可导入的分享链接
   cache/  每个槽位最近一次拉取的原始配置（用于新旧对比）
 启动：python server.py  ->  http://127.0.0.1:8765
@@ -11,9 +11,12 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -30,6 +33,11 @@ WARMING = False  # 冷启动预热中标志（预热线程完成后置 False）
 EXT_REFRESHING = False  # 外部订阅源刷新中标志
 EXT_ERRORS = {}         # 源 key -> 最近一次失败原因（成功即清除），用于界面显示"该源失效"
 EXT_ATTEMPT = {}        # 源 key -> 最近一次拉取尝试的时间戳（失败也记，避免自动刷新每分钟重试）
+SPEEDTEST_LOCK = threading.Lock()
+SPEEDTEST_CANCEL = threading.Event()
+SPEEDTEST_BYTES = 1024 * 1024  # 每个节点下载 1 MiB，避免测速意外消耗大量流量
+SPEEDTEST_STATE = dict(running=False, phase="idle", total=0, completed=0,
+                       current="", skipped=0, results=[], error="")
 
 # 外部公共订阅源（2026-10-31 逐个实测筛出，兼顾协议互补与更新时段）
 # mirror 是 jsDelivr CDN 兜底，relay 是 wget.la 反代镜像——国内不开代理也能直连
@@ -198,7 +206,7 @@ def open_url(url, timeout=25, headers=None):
     """统一的出网入口：探到本机代理就走代理，没探到就直连（忽略环境里可能存在的无关代理）。
     代理中途坏了（进程退出或节点挂了）不能空手而归：清缓存重探一次，还不行就退到纯直连——
     GitHub 类站点直连必被掐，但 wget.la 镜像直连是通的，这条退路得留着。"""
-    hdrs = {"User-Agent": "Mozilla/5.0 FreeProxyPanel"}
+    hdrs = {"User-Agent": "Mozilla/5.0 ChromeGoPanel"}
     hdrs.update(headers or {})
     proxy = detect_proxy()
     try:
@@ -748,7 +756,7 @@ def build_sub_clash():
                 tolerance=100, **{"lazy": True, "max-fails": 3})
     if verified:
         groups = [
-            {"name": "freeproxy-panel", "type": "select",
+            {"name": "chromego-panel", "type": "select",
              "proxies": ["自动-精选", "自动-全部", "精选", "全部"]},
             {"name": "自动-精选", "type": "url-test", "proxies": list(verified), **test},
             {"name": "自动-全部", "type": "url-test", "proxies": list(names), **test},
@@ -757,13 +765,13 @@ def build_sub_clash():
         ]
     else:  # 一条 TLS 节点都没有时退化成旧的两组结构，避免空组让客户端报错
         groups = [
-            {"name": "freeproxy-panel", "type": "select", "proxies": ["自动选择"] + names},
+            {"name": "chromego-panel", "type": "select", "proxies": ["自动选择"] + names},
             {"name": "自动选择", "type": "url-test", "proxies": list(names), **test},
         ]
     return yaml.dump({
         "proxies": proxies,
         "proxy-groups": groups,
-        "rules": ["MATCH,freeproxy-panel"],
+        "rules": ["MATCH,chromego-panel"],
     }, allow_unicode=True, sort_keys=False)
 
 
@@ -997,6 +1005,227 @@ def ext_alive():
             + round_robin(pools["hy2"], EXT_KEEP_HY2))
 
 
+def _find_mihomo():
+    """查找用户已安装的 Mihomo 可执行文件；不自动下载或安装第三方内核。"""
+    names = ("mihomo", "mihomo.exe", "clash-meta", "clash-meta.exe")
+    candidates = []
+    configured = os.environ.get("CHROMEGO_MIHOMO", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    for folder in {PANEL_DIR, Path(sys.executable).resolve().parent}:
+        candidates.extend(folder / name for name in names)
+    checked = set()
+    for path in candidates:
+        try:
+            path = path.resolve()
+            if path in checked:
+                continue
+            checked.add(path)
+            if path.is_file() and (os.name == "nt" or os.access(path, os.X_OK)):
+                return str(path)
+        except OSError:
+            continue
+    return None
+
+
+def _free_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_mihomo(proc, port, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("Mihomo 启动失败或配置不受支持")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError("Mihomo 本地测速代理启动超时")
+
+
+def _speedtest_one(binary, url, name):
+    """用单独的 Mihomo 进程测试一个订阅节点；函数返回前一定关闭该进程。"""
+    proxy_name = "ChromeGo-Speedtest"
+    proxy = _clash_proxy(url, proxy_name)
+    if not proxy:
+        return dict(name=name, protocol=url.partition(":")[0], status="failed",
+                    latency_ms=None, speed_mbps=None, downloaded_bytes=0,
+                    error="此节点格式不受测速内核支持")
+
+    port = _free_local_port()
+    cfg = {
+        "mixed-port": port,
+        "bind-address": "127.0.0.1",
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "error",
+        "ipv6": False,
+        "proxies": [proxy],
+        "proxy-groups": [{"name": "CG-SPEEDTEST", "type": "select", "proxies": [proxy_name]}],
+        "rules": ["MATCH,CG-SPEEDTEST"],
+    }
+    result = dict(name=name, protocol=url.partition(":")[0], status="failed",
+                  latency_ms=None, speed_mbps=None, downloaded_bytes=0, error="连接测试失败")
+    proc = None
+    with tempfile.TemporaryDirectory(prefix="chromego-speedtest-") as tmp:
+        cfg_path = Path(tmp) / "config.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      cwd=tmp, close_fds=True)
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.Popen([binary, "-f", str(cfg_path)], **kwargs)
+            _wait_for_mihomo(proc, port)
+            proxy_url = f"http://127.0.0.1:{port}"
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}),
+                urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            )
+
+            # 先通过当前节点访问 Cloudflare 轻量探测地址，记录完整请求往返延迟。
+            started = time.perf_counter()
+            with opener.open(urllib.request.Request("https://www.cloudflare.com/cdn-cgi/trace", method="HEAD"),
+                             timeout=8) as response:
+                if response.status >= 400:
+                    raise OSError("探测站返回错误")
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000)
+            result["status"] = "connected"
+            result["error"] = "下载测速失败"
+
+            # 通过同一条节点下载固定 1 MiB 样本，按实际接收字节数计算有效速率。
+            started = time.perf_counter()
+            request = urllib.request.Request(
+                f"https://speed.cloudflare.com/__down?bytes={SPEEDTEST_BYTES}",
+                headers={"Cache-Control": "no-cache"},
+            )
+            with opener.open(request, timeout=20) as response:
+                if response.status >= 400:
+                    raise OSError("测速站返回错误")
+                remaining = SPEEDTEST_BYTES
+                while remaining > 0:
+                    chunk = response.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    result["downloaded_bytes"] += len(chunk)
+                    remaining -= len(chunk)
+            elapsed = max(time.perf_counter() - started, 0.001)
+            if result["downloaded_bytes"]:
+                result["speed_mbps"] = round(result["downloaded_bytes"] * 8 / elapsed / 1_000_000, 2)
+                result["status"] = "ok"
+                result["error"] = ""
+        except Exception:
+            # 不把链接、认证字段、异常栈或本机路径回传给浏览器。
+            pass
+        finally:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+    return result
+
+
+def _speedtest_sort_key(row):
+    speed = row.get("speed_mbps")
+    latency = row.get("latency_ms")
+    return (speed is None, -(speed or 0), latency if latency is not None else float("inf"),
+            row.get("name", "").casefold())
+
+
+def speedtest_snapshot():
+    """返回不含分享链接/认证信息的测速状态，结果按下载速度从高到低排列。"""
+    with SPEEDTEST_LOCK:
+        data = dict(SPEEDTEST_STATE)
+        safe_fields = ("name", "protocol", "status", "latency_ms", "speed_mbps", "downloaded_bytes", "error")
+        rows = [{key: row.get(key) for key in safe_fields} for row in SPEEDTEST_STATE["results"]]
+        data["excluded"] = sum(row.get("status") == "failed" for row in rows)
+        data["results"] = sorted((row for row in rows if row.get("status") != "failed"), key=_speedtest_sort_key)
+        return data
+
+
+def _speedtest_worker(nodes, binary):
+    try:
+        for index, (url, name) in enumerate(nodes, 1):
+            if SPEEDTEST_CANCEL.is_set():
+                break
+            with SPEEDTEST_LOCK:
+                SPEEDTEST_STATE.update(phase="testing", current=name)
+            try:
+                result = _speedtest_one(binary, url, name)
+            except Exception:
+                result = dict(name=name, protocol=url.partition(":")[0], status="failed",
+                              latency_ms=None, speed_mbps=None, downloaded_bytes=0,
+                              error="连接测试失败")
+            with SPEEDTEST_LOCK:
+                SPEEDTEST_STATE["results"].append(result)
+                SPEEDTEST_STATE["completed"] = index
+                SPEEDTEST_STATE["current"] = ""
+        with SPEEDTEST_LOCK:
+            SPEEDTEST_STATE.update(running=False,
+                                   phase="stopped" if SPEEDTEST_CANCEL.is_set() else "complete",
+                                   current="")
+    except Exception as e:
+        with SPEEDTEST_LOCK:
+            SPEEDTEST_STATE.update(running=False, phase="error", current="",
+                                   error=f"测速中断：{type(e).__name__}")
+
+
+def start_speedtest():
+    """对当前面板订阅中的节点逐条测速；只在用户显式请求时启动。"""
+    with SPEEDTEST_LOCK:
+        if SPEEDTEST_STATE["running"]:
+            return False, "正在测速，请稍候"
+    binary = _find_mihomo()
+    if not binary:
+        return False, ("找不到 Mihomo 内核。请先安装 Mihomo 并将 mihomo/mihomo.exe 加入 PATH，"
+                       "或放到 ChromeGo 程序同目录；面板不会自动下载内核。")
+
+    nodes, skipped = [], 0
+    try:
+        for url, name in iter_unique_links(v2n_only=False):
+            try:
+                if _clash_proxy(url, "ChromeGo-Speedtest"):
+                    nodes.append((url, name))
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+    except Exception:
+        return False, "读取当前订阅失败，请稍后重试"
+    if not nodes:
+        return False, "当前订阅没有可测速节点；请先等待缓存预热或更新订阅源。"
+
+    with SPEEDTEST_LOCK:
+        if SPEEDTEST_STATE["running"]:
+            return False, "正在测速，请稍候"
+        SPEEDTEST_CANCEL.clear()
+        SPEEDTEST_STATE.update(running=True, phase="starting", total=len(nodes), completed=0,
+                               current="", skipped=skipped, results=[], error="")
+        threading.Thread(target=_speedtest_worker, args=(nodes, binary), daemon=True).start()
+    return True, f"已开始逐条测试 {len(nodes)} 个节点"
+
+
+def stop_speedtest():
+    with SPEEDTEST_LOCK:
+        if not SPEEDTEST_STATE["running"]:
+            return False
+        SPEEDTEST_CANCEL.set()
+        SPEEDTEST_STATE["phase"] = "stopping"
+        return True
+
+
 def refresh_ext_all(background=True):
     """刷新全部外部源。默认后台跑，**四个源并行**（各自下载 + 真握手测活，总耗时约等于最慢
     的一个源，通常一分多钟），立即返回。已在刷新时直接跳过。"""
@@ -1073,6 +1302,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8", code)
 
+    def _same_origin(self):
+        origin = self.headers.get("Origin")
+        if not origin:  # 允许本机脚本/命令行调用
+            return True
+        try:
+            return urllib.parse.urlparse(origin).netloc.casefold() == (self.headers.get("Host") or "").casefold()
+        except Exception:
+            return False
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             # 禁缓存：页面迭代频繁，浏览器缓存旧 JS 会导致新功能"没生效"
@@ -1080,8 +1318,14 @@ class Handler(BaseHTTPRequestHandler):
                        Cache_Control="no-store, must-revalidate")
         elif self.path == "/api/tools":
             # 槽位级手动拉取（/api/fetch）已砍掉，这个接口只剩订阅地址和预热状态
+            host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
+            scheme = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip().lower()
+            if scheme not in ("http", "https"):
+                scheme = "http"
             self._json(dict(panel_dir=str(PANEL_DIR), warming=WARMING,
-                            sub_url=f"http://127.0.0.1:{PORT}/sub/{SUB_TOKEN}"))
+                            sub_url=f"{scheme}://{host}/sub/{SUB_TOKEN}"))
+        elif self.path == "/api/speedtest":
+            self._json(speedtest_snapshot())
         elif self.path == "/api/ext":
             exts = []
             for key, src in EXT_SOURCES.items():
@@ -1109,7 +1353,7 @@ class Handler(BaseHTTPRequestHandler):
             # 客户端「更新订阅」失败时用户能看懂去面板复制新地址
             given = self.path[5:].rstrip("/")
             if given != SUB_TOKEN:
-                self._send("订阅地址无效：请打开 FreeProxy 面板，复制上面展示的订阅地址（老地址已停用）".encode("utf-8"),
+                self._send("订阅地址无效：请打开 ChromeGo 面板，复制上面展示的订阅地址（老地址已停用）".encode("utf-8"),
                            "text/plain; charset=utf-8", 403)
                 return
             ua = self.headers.get("User-Agent", "").lower()
@@ -1126,6 +1370,19 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         except Exception:
             return self._json(dict(error="请求体不是合法 JSON"), 400)
+
+        if self.path == "/api/speedtest":
+            if not self._same_origin():
+                return self._json(dict(error="拒绝跨站测速请求"), 403)
+            ok, hint = start_speedtest()
+            return self._json(dict(ok=ok, hint=hint) if ok else dict(ok=False, error=hint),
+                              202 if ok else 409)
+
+        if self.path == "/api/speedtest_stop":
+            if not self._same_origin():
+                return self._json(dict(error="拒绝跨站测速请求"), 403)
+            stopped = stop_speedtest()
+            return self._json(dict(ok=stopped, hint="当前节点完成后停止" if stopped else "当前没有测速任务"))
 
         if self.path == "/api/ext_refresh":
             if EXT_REFRESHING:  # 连点两下别起两个刷新线程
@@ -1163,7 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global WARMING
     url = f"http://127.0.0.1:{PORT}"
-    print(f"FreeProxy 节点面板  ->  {url}")
+    print(f"ChromeGo 节点面板  ->  {url}")
     print(f"面板目录          ->  {PANEL_DIR}")
     print(f"配置缓存          ->  {CACHE_DIR}")
     print("关闭这个窗口即退出面板")

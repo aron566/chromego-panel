@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FreeProxy 节点面板</title>
+<title>ChromeGo 节点面板</title>
 <style>
   :root {
     --bg: #f4f4f8;
@@ -125,6 +125,10 @@
   .tog { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none }
   .tog input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer }
   .tog.on { color: var(--text); font-weight: 600 }
+  .speed-table-wrap { overflow-x: auto; margin-top: 14px }
+  .speed-table { width: 100%; min-width: 620px; border-collapse: collapse; font-size: 13px }
+  .speed-table th, .speed-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line) }
+  .speed-table th { color: var(--muted); font-weight: 700 }
   footer { border-top: 1px solid var(--line); padding: 28px 0; text-align: center; color: var(--muted); font-size: 13px }
   @media (max-width: 720px) {
     .hero h1 { font-size: 28px }
@@ -134,14 +138,14 @@
 <body>
 <nav>
   <div class="wrap nav-in">
-    <div class="logo">FreeProxy<span> · 节点面板</span></div>
+    <div class="logo">ChromeGo<span> · 节点面板</span></div>
   </div>
 </nav>
 
 <header class="hero">
   <div class="wrap">
     <div class="badge">⚡ 本地运行 · 数据不出你的电脑</div>
-    <h1>FreeProxy <em>节点面板</em></h1>
+    <h1>ChromeGo <em>节点面板</em></h1>
     <p>打开就能用：面板把两类来源（ChromeGo 节点池 · 外部公共源）的免费节点拉好、去掉重复的，你只要把订阅地址粘进 v2rayN / Clash，客户端会自己挑能用的节点。</p>
   </div>
 </header>
@@ -184,6 +188,18 @@
     <div class="desc" id="extInfo" style="margin:8px 0 0; display:block">加载中…</div>
     <div class="src" id="extRows" style="margin-top:4px"></div>
     <div class="hint-ok" id="extDone" hidden style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel" id="speedPanel">
+    <h2>节点测速 · 按下载速度排序</h2>
+    <p class="desc">逐个读取当前订阅里的节点，用 Mihomo 单独连接测试 HTTPS 响应延迟和下载速度。每个节点最多下载 1 MiB；节点较多时会花较久，并产生相应流量。结果只保存在本次运行内存中。</p>
+    <p class="why" style="margin-bottom:12px">需要你已安装 Mihomo 内核（命令名为 <code>mihomo</code>），并加入 PATH，或放在 ChromeGo 程序同目录。面板不会自动下载内核。测试会通过每个节点访问 Cloudflare 的探测页和测速页。</p>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+      <button class="btn btn2" id="speedBtn" onclick="doSpeedTest()">测速当前订阅</button>
+      <button class="copy" id="speedStopBtn" onclick="stopSpeedTest()" disabled>停止测速</button>
+      <span class="desc" id="speedStatus" style="margin:0">尚未开始</span>
+    </div>
+    <div id="speedResults"></div>
   </div>
 
   <div class="panel">
@@ -370,8 +386,75 @@ async function doSaveProxy(inp) {
   loadExt();  // 网络状态那行会跟着重探结果刷新
 }
 
+let _speedPoll = null;
+
+function renderSpeedtest(d) {
+  const status = document.getElementById('speedStatus');
+  const btn = document.getElementById('speedBtn');
+  const stop = document.getElementById('speedStopBtn');
+  btn.disabled = !!d.running;
+  btn.textContent = d.running ? '正在逐个测速…' : '测速当前订阅';
+  stop.disabled = !d.running;
+  if (d.running) {
+    const current = d.current ? ` · 当前：${d.current}` : '';
+    status.textContent = d.phase === 'stopping'
+      ? `正在结束当前节点（${d.completed}/${d.total}）`
+      : `进度 ${d.completed}/${d.total}${current}`;
+  } else if (d.phase === 'complete') {
+    status.textContent = `完成：${d.completed}/${d.total} · 可连接 ${d.results.length} · 剔除无法连接 ${d.excluded || 0}${d.skipped ? ` · 跳过 ${d.skipped} 个不支持的节点` : ''}`;
+  } else if (d.phase === 'stopped') {
+    status.textContent = `已停止：完成 ${d.completed}/${d.total} · 可连接 ${d.results.length} · 剔除无法连接 ${d.excluded || 0}`;
+  } else if (d.phase === 'error') {
+    status.textContent = d.error || '测速中断';
+  }
+
+  const rows = (d.results || []).map((r, i) => {
+    const state = r.status === 'ok' ? '<span class="pill ok">已测</span>'
+      : r.status === 'connected' ? '<span class="pill mid">已连通</span>'
+      : '<span class="pill no">未连通</span>';
+    const speed = r.speed_mbps == null ? '—' : `${Number(r.speed_mbps).toFixed(2)} Mbps`;
+    const latency = r.latency_ms == null ? '—' : `${Number(r.latency_ms)} ms`;
+    const note = r.error ? ` <span style="color:var(--muted)">${esc(r.error)}</span>` : '';
+    return `<tr><td>${i + 1}</td><td>${esc(r.name)}</td><td>${esc(r.protocol)}</td><td>${latency}</td><td><b>${speed}</b></td><td>${state}${note}</td></tr>`;
+  }).join('');
+  document.getElementById('speedResults').innerHTML = rows
+    ? `<div class="speed-table-wrap"><table class="speed-table"><thead><tr><th>#</th><th>节点</th><th>协议</th><th>HTTPS 响应延迟</th><th>下载速率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : '';
+}
+
+async function loadSpeedtest() {
+  try {
+    const d = await (await fetch('/api/speedtest')).json();
+    renderSpeedtest(d);
+    if (_speedPoll) clearTimeout(_speedPoll);
+    _speedPoll = d.running ? setTimeout(loadSpeedtest, 1200) : null;
+  } catch (e) { /* 服务未起时静默 */ }
+}
+
+async function doSpeedTest() {
+  const status = document.getElementById('speedStatus');
+  status.textContent = '正在读取当前订阅…';
+  try {
+    const response = await fetch('/api/speedtest', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d = await response.json();
+    if (!response.ok) {
+      status.textContent = d.error || '无法开始测速';
+      return;
+    }
+    loadSpeedtest();
+  } catch (e) { status.textContent = `无法开始测速：${e}`; }
+}
+
+async function stopSpeedTest() {
+  try {
+    await fetch('/api/speedtest_stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    loadSpeedtest();
+  } catch (e) { document.getElementById('speedStatus').textContent = `停止请求失败：${e}`; }
+}
+
 loadTools();
 loadExt();
+loadSpeedtest();
 </script>
 </body>
 </html>
